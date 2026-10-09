@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-# vi: from fusion_lab.workspace_support import get_tracking_params
-# vi: import numpy as np
+from fusion_lab.workspace_support import get_tracking_params
+import numpy as np
 
 
 def init_track_state_from_meas(meas: Any) -> dict[str, Any]:
@@ -21,9 +21,34 @@ def init_track_state_from_meas(meas: Any) -> dict[str, Any]:
     Returns:
         Dict with keys ``x``, ``P``, ``state``, ``score`` (matrices as ``np.matrix``).
     """
-    # vi: TODO Part H — đổi meas.z sang vehicle frame; x = [pos; 0 velocity];
-    # vi: P block pos từ R xoay, vel từ sigma_p44/55/66; score = 1/window; state initialized.
-    raise NotImplementedError("TODO: implement init_track_state_from_meas")
+    params = get_tracking_params()
+
+    # Convert measurement position to vehicle frame using sens_to_veh transform
+    transform = np.asarray(meas.sensor.sens_to_veh)
+    meas_pos = np.asarray(meas.z).reshape(-1)
+    pos_veh = transform[:3, :3] @ meas_pos + transform[:3, 3]
+
+    # State: [px, py, pz, vx, vy, vz] — initialize velocity to zero
+    x = np.asmatrix(np.r_[pos_veh, [0.0, 0.0, 0.0]]).T
+
+    # Position covariance: rotate lidar R into vehicle frame
+    R_lidar = np.asarray(meas.R)
+    rot = transform[:3, :3]
+    P_pos = rot @ R_lidar @ rot.T
+
+    # Velocity covariance: broad initial uncertainty
+    P_vel = np.diag([params.sigma_p44**2, params.sigma_p55**2, params.sigma_p66**2])
+
+    # Assemble 6x6 covariance matrix
+    P = np.asmatrix(np.zeros((6, 6)))
+    P[:3, :3] = P_pos
+    P[3:, 3:] = P_vel
+
+    # Initial score and state
+    score = 1.0 / params.window
+    state = "initialized"
+
+    return {"x": x, "P": P, "state": state, "score": score}
 
 
 def update_track_score(track: dict[str, Any], associated: bool) -> dict[str, Any]:
@@ -39,10 +64,35 @@ def update_track_score(track: dict[str, Any], associated: bool) -> dict[str, Any
     Returns:
         Updated track dict.
     """
-    # vi: TODO Part H — chỉ lidar: hit +1/window (tối đa 1), miss trong FOV -1/window.
-    # vi: score > confirmed_threshold → confirmed; đã confirmed không hạ trạng thái.
-    # vi: Camera không gọi hàm này; track chưa confirmed với hit → tentative.
-    raise NotImplementedError("TODO: implement update_track_score")
+    params = get_tracking_params()
+    score = track["score"]
+    state = track["state"]
+
+    if associated:
+        # Hit: add 1/window, cap at 1
+        score = min(1.0, score + 1.0 / params.window)
+    else:
+        # Miss within FOV: subtract 1/window
+        score = score - 1.0 / params.window
+
+    # Update state: confirm if score exceeds threshold
+    if score > params.confirmed_threshold:
+        state = "confirmed"
+    elif state == "confirmed":
+        # Preserve confirmed state after misses (don't downgrade)
+        pass
+    elif state == "initialized" and associated:
+        state = "tentative"
+    elif state == "initialized":
+        # initialized miss stays initialized
+        pass
+    else:
+        state = "tentative"
+
+    # Mutate in place and also return
+    track["score"] = score
+    track["state"] = state
+    return track
 
 
 def should_delete_track(track: dict[str, Any]) -> bool:
@@ -58,7 +108,21 @@ def should_delete_track(track: dict[str, Any]) -> bool:
     Returns:
         True if track should be removed.
     """
-    # vi: TODO Part H — Pxx hoặc Pyy > max_P: xóa bất kể score.
-    # vi: confirmed: xóa khi score < delete_threshold; chưa confirmed: score <= 0.
-    # vi: Các điều kiện là OR; camera không đánh giá/xóa track.
-    raise NotImplementedError("TODO: implement should_delete_track")
+    params = get_tracking_params()
+    score = track["score"]
+    state = track["state"]
+    P = track["P"]
+
+    # Condition 1: horizontal variance exceeds max_P (Pxx or Pyy > max_P)
+    if float(P[0, 0]) > params.max_P or float(P[1, 1]) > params.max_P:
+        return True
+
+    # Condition 2: confirmed track with score below delete_threshold
+    if state == "confirmed" and score < params.delete_threshold:
+        return True
+
+    # Condition 3: unconfirmed track with score <= 0
+    if state != "confirmed" and score <= 0:
+        return True
+
+    return False
